@@ -172,6 +172,7 @@ func main() {
 	elapsed := time.Since(start)
 	fmt.Printf("----->  run with time: %s\n", elapsed)
 	if strings.ToUpper(*action) == "CLEAN" {
+		// step drop old table and table log
 		db.cleanOriginTable(*tableName)
 	} else if strings.ToUpper(*action) == "NEW" {
 		db.stepCreateTableLikeFuncAndSequencsFunc()
@@ -183,15 +184,22 @@ func main() {
 		indexQuery, _ := db.swapDataInTable(*tableName)
 		// step apply from log to new table
 		db.applyRecordFromLogToCurrentTable(*tableName)
+		// step set index
 		db.execIndex(indexQuery)
+		commandClean := fmt.Sprintf("go run repack.go --h=%s --u=%s --p=%s --d=%s --t=%s --a=CLEAN", *dbHost, *username, *password, *dbName, *tableName)
+		fmt.Println("Clean old table and table log with command: ", commandClean)
 	}
 }
 
 func (db *DB) execIndex(indexQuery string) error {
+	fmt.Printf("====== Begin set index ======\n")
+	start := time.Now()
 	_, err := db.Exec(indexQuery)
 	if err != nil {
 		fmt.Println("Error exec index: ", err.Error())
 	}
+	elapsed := time.Since(start)
+	fmt.Printf("----->  run with time: %s\n", elapsed)
 	return err
 }
 
@@ -274,7 +282,7 @@ func (db *DB) swapDataInTable(tableName string) (string, error) {
 	fmt.Println("==> Find constsaints..")
 	var sqlConstraints = ""
 	var sqlRenameIndex = ""
-	indexdefs, indexnames := db.findAllConstraints(tableName, tableTempTemp)
+	indexdefs, indexnames := db.findAllConstraints(tableName)
 	if len(indexdefs) > 0 {
 		sqlConstraints = strings.Join(indexdefs, ";")
 	}
@@ -399,7 +407,7 @@ func (db *DB) applyRecordFromLogToCurrentTable(tableName string) error {
 	return err
 }
 
-func (db *DB) findAllConstraints(tableName string, tableTempTemp string) ([]string, []string) {
+func (db *DB) findAllConstraints(tableName string) ([]string, []string) {
 	rows, err := db.Query(SQL_CONSTRAINTS_INDEXS, tableName)
 	if err != nil {
 		fmt.Println("\nError find constraints :", err.Error())
@@ -409,12 +417,12 @@ func (db *DB) findAllConstraints(tableName string, tableTempTemp string) ([]stri
 	var indexnames []string
 	for rows.Next() {
 		var indexdef, indexname sql.NullString
-		err = rows.Scan(&indexdef)
+		err = rows.Scan(&indexdef, &indexname)
 		if err != nil {
 			fmt.Println("Error loop list constraints: ", err.Error())
 		}
 		indexdefs = append(indexdefs, indexdef.String)
-		indexnames = append(indexnames, fmt.Sprintf(SQL_RENAME_INDEX, indexname.String, strings.ReplaceAll(indexname.String, tableName, tableTempTemp)))
+		indexnames = append(indexnames, fmt.Sprintf(SQL_RENAME_INDEX, indexname.String, fmt.Sprintf("temp_%s", indexname.String)))
 	}
 	return indexdefs, indexnames
 }
