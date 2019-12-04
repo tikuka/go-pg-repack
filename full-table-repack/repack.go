@@ -141,7 +141,6 @@ const (
 				RENAME TO %s;
 			%s
 			%s
-			%s
 			%s;
 		COMMIT;
 	`
@@ -151,8 +150,9 @@ const (
 	SQL_DROP_TRIGGER       = `DROP TRIGGER $table-name_trigger ON $table-name_temp_temp;`
 	SQL_DROP_FUNC          = `DROP FUNCTION %s_func;`
 	SQL_DROP_CREATE_FUNC   = `DROP FUNCTION create_table_like;`
-	SQL_CONSTRAINTS_INDEXS = `SELECT indexdef FROM pg_indexes WHERE tablename = $1;`
+	SQL_CONSTRAINTS_INDEXS = `SELECT indexdef, indexname FROM pg_indexes WHERE tablename = $1;`
 	SQL_DROP_TEMP          = `DROP TABLE %s;`
+	SQL_RENAME_INDEX       = "ALTER INDEX %s RENAME TO %s"
 )
 
 func main() {
@@ -172,18 +172,27 @@ func main() {
 	elapsed := time.Since(start)
 	fmt.Printf("----->  run with time: %s\n", elapsed)
 	if strings.ToUpper(*action) == "CLEAN" {
-
+		db.cleanOriginTable(*tableName)
 	} else if strings.ToUpper(*action) == "NEW" {
-		err = db.stepCreateTableLikeFuncAndSequencsFunc()
+		db.stepCreateTableLikeFuncAndSequencsFunc()
 		// step create table log
-		err = db.stepCreateTableLog(*tableName)
+		db.stepCreateTableLog(*tableName)
 		// step create trigger
-		err = db.stepCreateTriggerAction(*tableName)
+		db.stepCreateTriggerAction(*tableName)
 		// step swap record
-		err = db.swapDataInTable(*tableName)
+		indexQuery, _ := db.swapDataInTable(*tableName)
 		// step apply from log to new table
-		err = db.applyRecordFromLogToCurrentTable(*tableName)
+		db.applyRecordFromLogToCurrentTable(*tableName)
+		db.execIndex(indexQuery)
 	}
+}
+
+func (db *DB) execIndex(indexQuery string) error {
+	_, err := db.Exec(indexQuery)
+	if err != nil {
+		fmt.Println("Error exec index: ", err.Error())
+	}
+	return err
 }
 
 func (db *DB) stepCreateTableLikeFuncAndSequencsFunc() error {
@@ -244,39 +253,66 @@ func (db *DB) createFunctionInsertToLog(tableName string) error {
 	return err
 }
 
-func (db *DB) swapDataInTable(tableName string) error {
+func (db *DB) swapDataInTable(tableName string) (string, error) {
 	fmt.Printf("====== Begin swap record to %s_temp ======\n", tableName)
 	start := time.Now()
 	tableTemp := fmt.Sprintf("%s_temp", tableName)
 	_, err := db.Exec(fmt.Sprintf(`SELECT create_table_like('%s','%s')`, tableName, tableTemp))
 	if err != nil {
 		fmt.Println("Error create temp table: ", err.Error())
-		return err
+		return "", err
 	}
 	_, err = db.Exec(fmt.Sprintf(SQL_SWAP_RECORD, tableTemp, tableName))
 	if err != nil {
 		fmt.Println("Error swap record: ", err.Error())
-		return err
+		return "", err
 	}
-	fmt.Println("==> Find constsaints..")
-	var sqlConstraints = ""
-	constraints := db.findAllConstraints(tableName)
-	if len(constraints) > 0 {
-		sqlConstraints = strings.Join(constraints, ";")
-	}
+
 	fmt.Println("* rename table a -> c b -> a \n")
 	tableTempTemp := fmt.Sprintf("%s_temp_temp", tableName)
+
+	fmt.Println("==> Find constsaints..")
+	var sqlConstraints = ""
+	var sqlRenameIndex = ""
+	indexdefs, indexnames := db.findAllConstraints(tableName, tableTempTemp)
+	if len(indexdefs) > 0 {
+		sqlConstraints = strings.Join(indexdefs, ";")
+	}
+	if len(indexnames) > 0 {
+		sqlRenameIndex = strings.Join(indexnames, ";")
+	}
 	dropTriggerSQl := strings.ReplaceAll(SQL_DROP_TRIGGER, "$table-name", tableName)
 	dropFuncSQL := fmt.Sprintf(SQL_DROP_FUNC, tableName)
-	dropTableTemp := fmt.Sprintf(SQL_DROP_TEMP, tableTempTemp)
-	_, err = db.Exec(fmt.Sprintf(SQL_RENAME_TABLE, tableName, tableTempTemp, tableTemp, tableName, dropTriggerSQl, dropFuncSQL, dropTableTemp, sqlConstraints))
+	_, err = db.Exec(fmt.Sprintf(SQL_RENAME_TABLE, tableName, tableTempTemp, tableTemp, tableName, dropTriggerSQl, dropFuncSQL, sqlRenameIndex))
 	if err != nil {
 		fmt.Println("Error rename table a -> c b -> a ", err.Error())
+		return "", err
+	}
+	elapsed := time.Since(start)
+	fmt.Printf("----->  run with time: %s\n", elapsed)
+	return sqlConstraints, err
+}
+
+func (db *DB) cleanOriginTable(tableName string) error {
+	fmt.Printf("====== Begin drop %s_temp ======\n", tableName)
+	start := time.Now()
+	tableTempTemp := fmt.Sprintf("%s_temp_temp", tableName)
+	dropTableTemp := fmt.Sprintf(SQL_DROP_TEMP, tableTempTemp)
+	_, err := db.Exec(dropTableTemp)
+	if err != nil {
+		fmt.Println("Drop table temp origin", err.Error())
+		return err
+	}
+	tableLog := fmt.Sprintf("%s_log", tableName)
+	dropTablelog := fmt.Sprintf(SQL_DROP_TEMP, tableLog)
+	_, err = db.Exec(dropTablelog)
+	if err != nil {
+		fmt.Println("Drop table log origin", err.Error())
 		return err
 	}
 	elapsed := time.Since(start)
 	fmt.Printf("----->  run with time: %s\n", elapsed)
-	return err
+	return nil
 }
 
 func (db *DB) applyRecordFromLogToCurrentTable(tableName string) error {
@@ -363,22 +399,24 @@ func (db *DB) applyRecordFromLogToCurrentTable(tableName string) error {
 	return err
 }
 
-func (db *DB) findAllConstraints(tableName string) []string {
+func (db *DB) findAllConstraints(tableName string, tableTempTemp string) ([]string, []string) {
 	rows, err := db.Query(SQL_CONSTRAINTS_INDEXS, tableName)
 	if err != nil {
 		fmt.Println("\nError find constraints :", err.Error())
 	}
 	defer rows.Close()
-	var results []string
+	var indexdefs []string
+	var indexnames []string
 	for rows.Next() {
-		var query sql.NullString
-		err = rows.Scan(&query)
+		var indexdef, indexname sql.NullString
+		err = rows.Scan(&indexdef)
 		if err != nil {
 			fmt.Println("Error loop list constraints: ", err.Error())
 		}
-		results = append(results, query.String)
+		indexdefs = append(indexdefs, indexdef.String)
+		indexnames = append(indexnames, fmt.Sprintf(SQL_RENAME_INDEX, indexname.String, strings.ReplaceAll(indexname.String, tableName, tableTempTemp)))
 	}
-	return results
+	return indexdefs, indexnames
 }
 
 func connectPostgresqlDatabase(dbHost, username, password, dbName string) (dbObject *DB, err error) {
